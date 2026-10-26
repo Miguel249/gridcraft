@@ -89,7 +89,10 @@ pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
     let out = root.join("target").join("perf").join(&o.label);
     std::fs::create_dir_all(&out).map_err(|e| format!("bench: {}: {e}", out.display()))?;
     let write = |name: &str, text: &str| std::fs::write(out.join(name), text).map_err(|e| format!("bench: {name}: {e}"));
-    write("commit.txt", &capture("git", &["rev-parse", "HEAD"], root))?;
+    let commit = capture("git", &["rev-parse", "HEAD"], root);
+    // An executable given with --exe was built elsewhere: the commit is this checkout's, not its.
+    let commit = if o.exe.is_some() { format!("runner checkout (executable given with --exe): {commit}") } else { commit };
+    write("commit.txt", &commit)?;
     write("working-tree.txt", &capture("git", &["status", "--short"], root))?;
     write("rustc.txt", &capture("rustc", &["-Vv"], root))?;
     write("hardware.txt", &hardware(root))?;
