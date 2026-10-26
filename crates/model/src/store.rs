@@ -17,6 +17,11 @@ fn has_value(cell: &Cell) -> bool {
     !cell.value.is_empty() || cell.formula.is_some()
 }
 
+/// `c` lies on the first or last row or column of `r`.
+fn on_edge(r: RangeRef, c: CellRef) -> bool {
+    c.row == r.start.row || c.row == r.end.row || c.col == r.start.col || c.col == r.end.col
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct Band {
     /// row → (col → cell)
@@ -67,7 +72,10 @@ impl CellStore {
         }
         let band = Arc::make_mut(self.bands.entry(c.row / BAND).or_default());
         if band.rows.entry(c.row).or_default().insert(c.col, cell).is_none() {
-            self.bounds.take();
+            // A new cell can only grow the bounds: extend a warm cache instead of dropping it.
+            if let Some(bounds) = self.bounds.get_mut() {
+                *bounds = Some(bounds.map_or(RangeRef::cell(c), |r| r.union(&RangeRef::cell(c))));
+            }
             self.len += 1;
         }
     }
@@ -99,7 +107,11 @@ impl CellStore {
         if !band.rows.get(&c.row).is_some_and(|r| r.contains_key(&c.col)) {
             return None;
         }
-        self.bounds.take();
+        // Each edge of the bounds holds a stored cell, so removing a cell inside them leaves them
+        // as they are; only a cell on an edge can shrink them.
+        if self.bounds.get().is_some_and(|b| b.is_none_or(|r| on_edge(r, c))) {
+            self.bounds.take();
+        }
         let b = Arc::make_mut(band);
         let row = b.rows.get_mut(&c.row)?;
         let old = row.remove(&c.col);
@@ -372,6 +384,90 @@ mod tests {
         assert_bounds(&s);
         assert_bounds(&snapshot);
         assert_eq!(snapshot.used_range(), Some(RangeRef::new(c(0, 0), c(1000, 10))));
+    }
+
+    /// Each mutator runs on a warm cache and must leave `used_range` equal to a fresh scan.
+    #[test]
+    fn every_mutator_keeps_cached_bounds_equal_to_a_fresh_scan() {
+        fn check(s: &CellStore, what: &str) {
+            assert_eq!(s.used_range(), s.compute_used_range(), "{what}");
+        }
+        let one = || Cell::value(1.0.into());
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = |n: u32| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % u64::from(n)) as u32
+        };
+        let mut s = CellStore::new();
+        for step in 0..3000 {
+            s.used_range();
+            let (r, col) = (next(300), next(40));
+            let what = match next(13) {
+                0..=3 => {
+                    s.set(c(r, col), one());
+                    "set"
+                }
+                4 => {
+                    s.set(c(r, col), Cell::default());
+                    "set blank"
+                }
+                5 | 6 => {
+                    s.remove(c(r, col));
+                    "remove"
+                }
+                7 => {
+                    if let Some(x) = s.get_mut(c(r, col)) {
+                        x.value = Value::Empty;
+                    }
+                    "get_mut"
+                }
+                8 => {
+                    s.take_range(RangeRef::new(c(r, col), c(r + next(20), col + next(5))));
+                    "take_range"
+                }
+                9 => {
+                    s.shift_rows(r, i64::from(next(7)) - 3);
+                    "shift_rows"
+                }
+                10 => {
+                    s.shift_cols(col, i64::from(next(7)) - 3);
+                    "shift_cols"
+                }
+                11 => {
+                    s.shift_cols_in_rows(r, r + next(30), col, i64::from(next(7)) - 3);
+                    "shift_cols_in_rows"
+                }
+                _ => {
+                    s.shift_rows_in_cols(col, col + next(5), r, i64::from(next(7)) - 3);
+                    "shift_rows_in_cols"
+                }
+            };
+            check(&s, &format!("{what} at step {step}"));
+        }
+        s.used_range();
+        s.rebuild();
+        check(&s, "rebuild");
+        let restored: CellStore = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        check(&restored, "deserialized");
+    }
+
+    #[test]
+    fn inserts_and_interior_removals_keep_the_bounds_cache_warm() {
+        let mut s = CellStore::new();
+        for (row, col) in [(0, 0), (10, 10), (5, 5)] {
+            s.set(c(row, col), Cell::value(1.0.into()));
+        }
+        assert_eq!(s.used_range(), Some(RangeRef::new(c(0, 0), c(10, 10))));
+        s.set(c(20, 3), Cell::value(1.0.into()));
+        assert!(s.bounds.get().is_some(), "a new cell extends the cached bounds");
+        assert_eq!(s.used_range(), Some(RangeRef::new(c(0, 0), c(20, 10))));
+        s.remove(c(5, 5));
+        assert!(s.bounds.get().is_some(), "removing an interior cell keeps them");
+        s.remove(c(20, 3));
+        assert!(s.bounds.get().is_none(), "removing a cell on an edge drops them");
+        assert_eq!(s.used_range(), Some(RangeRef::new(c(0, 0), c(10, 10))));
     }
 
     #[test]
