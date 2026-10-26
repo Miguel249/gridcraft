@@ -352,11 +352,35 @@ pub(crate) fn edit<R>(s: &mut Session, f: impl FnOnce(&mut Ctx) -> Result<R>) ->
     })
 }
 
+/// Opt-in phase timing (`GRIDCRAFT_PROFILE`), printed to stderr by the caller. It reads the clock
+/// only when profiling, and never on wasm: there `Instant::now` traps (`RuntimeError:
+/// unreachable`), which broke every edit in the web app.
+pub(crate) struct Profile(Option<std::time::Instant>);
+
+impl Profile {
+    pub(crate) fn start() -> Profile {
+        #[allow(clippy::disallowed_methods)]
+        let now = if cfg!(target_arch = "wasm32") { None } else { std::env::var_os("GRIDCRAFT_PROFILE").map(|_| std::time::Instant::now()) };
+        Profile(now)
+    }
+
+    /// Time since `start`, when profiling.
+    pub(crate) fn elapsed(&self) -> Option<std::time::Duration> {
+        self.0.map(|t| t.elapsed())
+    }
+
+    /// Time since `start` or the previous lap, when profiling; the next lap starts now.
+    pub(crate) fn lap(&mut self) -> Option<std::time::Duration> {
+        let elapsed = self.elapsed()?;
+        #[allow(clippy::disallowed_methods)]
+        let now = std::time::Instant::now();
+        self.0 = Some(now);
+        Some(elapsed)
+    }
+}
+
 pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>) -> Result<R> {
-    // `GRIDCRAFT_PROFILE` timing. Read the clock only when profiling, and never on wasm: there
-    // `Instant::now` traps (`RuntimeError: unreachable`), which broke every edit in the web app.
-    #[allow(clippy::disallowed_methods)]
-    let t0 = if cfg!(target_arch = "wasm32") { None } else { std::env::var_os("GRIDCRAFT_PROFILE").map(|_| std::time::Instant::now()) };
+    let profile = Profile::start();
     let mut sel = d.selection.clone();
     let mut ctx = Ctx {
         wb: (*d.wb).clone(),
@@ -378,8 +402,8 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
     if changed.len() <= 200_000 {
         fit_rows.extend(changed.iter().map(|(s, c)| (*s, c.row)));
     }
-    if let Some(t0) = t0 {
-        eprintln!("commit: edit {:?}, {} changed", t0.elapsed(), changed.len());
+    if let Some(t) = profile.elapsed() {
+        eprintln!("commit: edit {t:?}, {} changed", changed.len());
     }
     if structural {
         if visibility_only && changed.is_empty() {
@@ -390,16 +414,16 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
     } else if !changed.is_empty() {
         d.calc.cells_changed(&mut wb, &changed);
     }
-    if let Some(t0) = t0 {
-        eprintln!("commit: + recalc {:?}", t0.elapsed());
+    if let Some(t) = profile.elapsed() {
+        eprintln!("commit: + recalc {t:?}");
     }
     fit_rows.sort_unstable();
     fit_rows.dedup();
     for (si, row) in fit_rows {
         auto_row_height(&mut wb, si, row);
     }
-    if let Some(t0) = t0 {
-        eprintln!("commit: + rows {:?}", t0.elapsed());
+    if let Some(t) = profile.elapsed() {
+        eprintln!("commit: + rows {t:?}");
     }
     d.wb = std::sync::Arc::new(wb);
     d.selection = sel;

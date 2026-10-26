@@ -620,6 +620,20 @@ fn filter_by(s: &mut Session, p: &Json) -> Result<Json> {
     Ok(json!({"hiddenRows": hidden}))
 }
 
+/// Whether `cmp` satisfies a comparison operator; `None` for the operators that are not one
+/// (`beginsWith`, `contains`…).
+fn ordering_satisfies(op: &str, cmp: Option<Ordering>) -> Option<bool> {
+    Some(match op {
+        "=" => cmp == Some(Ordering::Equal),
+        "<>" => cmp != Some(Ordering::Equal),
+        ">" => cmp == Some(Ordering::Greater),
+        "<" => cmp == Some(Ordering::Less),
+        ">=" => matches!(cmp, Some(Ordering::Greater | Ordering::Equal)),
+        "<=" => matches!(cmp, Some(Ordering::Less | Ordering::Equal)),
+        _ => return None,
+    })
+}
+
 /// Does a value pass a custom comparison (`>`, `=*abc*`, `<>x`…)?
 fn custom_ok(v: &Value, text: &str, op: &str, crit: &str) -> bool {
     let num = gridcraft_core::parse::parse_number_text(crit);
@@ -631,49 +645,77 @@ fn custom_ok(v: &Value, text: &str, op: &str, crit: &str) -> bool {
     };
     let wild = || super::edit::wildcard(&text.to_lowercase(), &crit.to_lowercase());
     match op {
-        "=" => {
-            if crit.contains(['*', '?']) {
-                wild()
-            } else {
-                cmp == Some(Ordering::Equal)
-            }
-        }
-        "<>" => {
-            if crit.contains(['*', '?']) {
-                !wild()
-            } else {
-                cmp != Some(Ordering::Equal)
-            }
-        }
-        ">" => cmp == Some(Ordering::Greater),
-        "<" => cmp == Some(Ordering::Less),
-        ">=" => matches!(cmp, Some(Ordering::Greater | Ordering::Equal)),
-        "<=" => matches!(cmp, Some(Ordering::Less | Ordering::Equal)),
+        "=" if crit.contains(['*', '?']) => wild(),
+        "<>" if crit.contains(['*', '?']) => !wild(),
         "beginsWith" => text.to_lowercase().starts_with(&crit.to_lowercase()),
         "endsWith" => text.to_lowercase().ends_with(&crit.to_lowercase()),
         "contains" => text.to_lowercase().contains(&crit.to_lowercase()),
         "notContains" => !text.to_lowercase().contains(&crit.to_lowercase()),
-        _ => true,
+        _ => ordering_satisfies(op, cmp).unwrap_or(true),
     }
 }
 
-/// Prepare comparisons once per filter, without changing ASCII-only value-list matching.
-enum PreparedFilter {
-    Values(std::collections::HashSet<String>),
-    Custom(Option<f64>, Option<f64>),
-    Other,
+/// `custom_ok` for a number against a numeric operand, without formatting the cell; `None`
+/// when the comparison needs the cell's text.
+fn numeric_comparison(v: &Value, number: Option<f64>, op: &str) -> Option<bool> {
+    ordering_satisfies(op, v.as_f64()?.partial_cmp(&number?))
 }
 
-fn numeric_comparison(v: &Value, number: Option<f64>, op: &str) -> Option<bool> {
-    let cmp = v.as_f64()?.partial_cmp(&number?);
-    match op {
-        "=" => Some(cmp == Some(Ordering::Equal)),
-        "<>" => Some(cmp != Some(Ordering::Equal)),
-        ">" => Some(cmp == Some(Ordering::Greater)),
-        "<" => Some(cmp == Some(Ordering::Less)),
-        ">=" => Some(matches!(cmp, Some(Ordering::Greater | Ordering::Equal))),
-        "<=" => Some(matches!(cmp, Some(Ordering::Less | Ordering::Equal))),
-        _ => None,
+/// One side of a custom filter, its operand parsed as a number once per filter.
+struct Comparison<'a> {
+    op: &'a str,
+    operand: &'a str,
+    number: Option<f64>,
+}
+
+impl<'a> Comparison<'a> {
+    fn new((op, operand): &'a (String, String)) -> Self {
+        Comparison { op: op.as_str(), operand: operand.as_str(), number: gridcraft_core::parse::parse_number_text(operand) }
+    }
+}
+
+/// A filter criterion with what it compares against worked out once per filter, not per row.
+enum Prepared<'a> {
+    /// The listed values, ASCII-lowercased (matching stays ASCII-only), and whether (Blanks) is
+    /// ticked.
+    Values(std::collections::HashSet<String>, bool),
+    /// One or two comparisons, and whether both must pass.
+    Custom(Comparison<'a>, Option<Comparison<'a>>, bool),
+    /// The value a cell must reach (none when the column holds no numbers), from which end.
+    Top10 {
+        bottom: bool,
+        threshold: Option<f64>,
+    },
+    AboveAverage {
+        above: bool,
+        average: f64,
+    },
+    FillColor(&'a Color),
+    FontColor(&'a Color),
+    Icon,
+}
+
+fn prepare<'a>(sh: &Sheet, r: RangeRef, col: u32, criterion: &'a FilterCriterion) -> Prepared<'a> {
+    let numbers =
+        || -> Vec<f64> { (r.start.row + 1..=r.end.row).filter_map(|row| sh.value_ref(CellRef::new(row, col)).and_then(Value::as_f64)).collect() };
+    match criterion {
+        FilterCriterion::Values { values, blanks } => Prepared::Values(values.iter().map(|s| s.to_ascii_lowercase()).collect(), *blanks),
+        FilterCriterion::Custom { a, b, and } => Prepared::Custom(Comparison::new(a), b.as_ref().map(Comparison::new), *and),
+        FilterCriterion::Top10 { bottom, percent, count } => {
+            let mut nums = numbers();
+            nums.sort_by(|a, b| if *bottom { a.partial_cmp(b) } else { b.partial_cmp(a) }.unwrap_or(Ordering::Equal));
+            let k = if *percent { ((nums.len() as f64) * (*count as f64) / 100.0).ceil() as usize } else { *count as usize };
+            let k = k.clamp(1, nums.len().max(1));
+            Prepared::Top10 { bottom: *bottom, threshold: nums.get(k - 1).copied() }
+        }
+        FilterCriterion::AboveAverage(above) => {
+            let nums = numbers();
+            let average = if nums.is_empty() { 0.0 } else { nums.iter().sum::<f64>() / nums.len() as f64 };
+            Prepared::AboveAverage { above: *above, average }
+        }
+        FilterCriterion::FillColor(color) => Prepared::FillColor(color),
+        FilterCriterion::FontColor(color) => Prepared::FontColor(color),
+        FilterCriterion::Icon { .. } => Prepared::Icon,
     }
 }
 
@@ -702,126 +744,67 @@ pub(crate) fn grow_autofilter(sh: &mut Sheet, at: CellRef) {
 
 /// Hides rows of the autofilter range that fail any criterion.
 pub(crate) fn apply_filter(wb: &mut Workbook, sheet: usize) {
-    // Same opt-in native clock as commit profiling; never read Instant on WASM.
-    #[allow(clippy::disallowed_methods)]
-    let profile = if cfg!(target_arch = "wasm32") { None } else { std::env::var_os("GRIDCRAFT_PROFILE").map(|_| std::time::Instant::now()) };
+    let mut profile = super::Profile::start();
     let Some(sh) = wb.sheet(sheet) else { return };
     let Some(af) = sh.autofilter.clone() else { return };
     let r = af.range;
-    let mut hide = Vec::new();
-    let prepared: Vec<PreparedFilter> = af
+    let criteria: Vec<(u32, Prepared)> = af
         .criteria
         .iter()
-        .map(|(_, c)| match c {
-            FilterCriterion::Values { values, .. } => PreparedFilter::Values(values.iter().map(|s| s.to_ascii_lowercase()).collect()),
-            FilterCriterion::Custom { a, b, .. } => PreparedFilter::Custom(
-                gridcraft_core::parse::parse_number_text(&a.1),
-                b.as_ref().and_then(|b| gridcraft_core::parse::parse_number_text(&b.1)),
-            ),
-            _ => PreparedFilter::Other,
+        .map(|(off, c)| {
+            let col = r.start.col.saturating_add(*off);
+            (col, prepare(sh, r, col, c))
         })
         .collect();
-    // Precompute per-criterion top10 threshold and average once, not per row.
-    let mut col_stats: std::collections::HashMap<usize, (Option<f64>, f64)> = std::collections::HashMap::new();
-    for (i, (off, c)) in af.criteria.iter().enumerate() {
-        if matches!(c, FilterCriterion::Top10 { .. } | FilterCriterion::AboveAverage(_)) {
-            let col = r.start.col + off;
-            let mut nums: Vec<f64> =
-                (r.start.row + 1..=r.end.row).filter_map(|row| sh.value_ref(CellRef::new(row, col)).and_then(Value::as_f64)).collect();
-            let avg = if nums.is_empty() { 0.0 } else { nums.iter().sum::<f64>() / nums.len() as f64 };
-            let thr = match c {
-                FilterCriterion::Top10 { bottom, percent, count } => {
-                    nums.sort_by(|a, b| if *bottom { a.partial_cmp(b) } else { b.partial_cmp(a) }.unwrap_or(Ordering::Equal));
-                    let k = if *percent { ((nums.len() as f64) * (*count as f64) / 100.0).ceil() as usize } else { *count as usize };
-                    let k = k.clamp(1, nums.len().max(1));
-                    nums.get(k - 1).copied()
-                }
-                _ => None,
-            };
-            col_stats.insert(i, (thr, avg));
-        }
+    if let Some(t) = profile.lap() {
+        eprintln!("filter: prepare/statistics {t:?}, {} criteria", criteria.len());
     }
-    if let Some(t) = profile {
-        eprintln!("filter: prepare/statistics {:?}, {} criteria", t.elapsed(), af.criteria.len());
-    }
-    #[allow(clippy::disallowed_methods)]
-    let evaluate = profile.map(|_| std::time::Instant::now());
+    let mut hide = Vec::new();
     for row in r.start.row + 1..=r.end.row {
-        let mut visible = true;
-        for (i, (off, crit)) in af.criteria.iter().enumerate() {
-            let c = CellRef::new(row, r.start.col + off);
+        let visible = criteria.iter().all(|(col, criterion)| {
+            let c = CellRef::new(row, *col);
             let v = sh.value_ref(c).unwrap_or(&Value::Empty);
-            let ok = match crit {
-                FilterCriterion::Values { values, blanks } => {
+            match criterion {
+                Prepared::Values(set, blanks) => {
                     if filter_blank(v) {
                         *blanks
                     } else {
-                        match prepared.get(i) {
-                            Some(PreparedFilter::Values(set)) => {
-                                set.contains(&v.display().to_ascii_lowercase())
-                                    || set.contains(&crate::display::cell_text(wb, sh, c).to_ascii_lowercase())
-                            }
-                            _ => values
-                                .iter()
-                                .any(|x| x.eq_ignore_ascii_case(&crate::display::cell_text(wb, sh, c)) || x.eq_ignore_ascii_case(&v.display())),
-                        }
+                        set.contains(&v.display().to_ascii_lowercase()) || set.contains(&crate::display::cell_text(wb, sh, c).to_ascii_lowercase())
                     }
                 }
-                FilterCriterion::Custom { a, b, and } => {
-                    let (na, nb) = match prepared.get(i) {
-                        Some(PreparedFilter::Custom(a, b)) => (*a, *b),
-                        _ => (None, None),
-                    };
+                Prepared::Custom(a, b, and) => {
                     // Display text is only needed for textual/wildcard comparisons. Numeric
                     // comparisons keep the same partial-order behaviour, including NaN.
                     let mut text = None;
-                    let mut compare = |pair: &(String, String), n| {
-                        numeric_comparison(v, n, &pair.0)
-                            .unwrap_or_else(|| custom_ok(v, text.get_or_insert_with(|| crate::display::cell_text(wb, sh, c)), &pair.0, &pair.1))
+                    let mut passes = |x: &Comparison| {
+                        numeric_comparison(v, x.number, x.op)
+                            .unwrap_or_else(|| custom_ok(v, text.get_or_insert_with(|| crate::display::cell_text(wb, sh, c)), x.op, x.operand))
                     };
-                    let x = compare(a, na);
+                    let x = passes(a);
                     match b {
                         Some(b) => {
-                            let y = compare(b, nb);
+                            let y = passes(b);
                             if *and { x && y } else { x || y }
                         }
                         None => x,
                     }
                 }
-                FilterCriterion::Top10 { bottom, .. } => match (v.as_f64(), col_stats.get(&i)) {
-                    (Some(n), Some((thr, _))) => {
-                        let thr = thr.unwrap_or(n);
-                        if *bottom { n <= thr } else { n >= thr }
-                    }
-                    _ => false,
-                },
-                FilterCriterion::AboveAverage(above) => match (v.as_f64(), col_stats.get(&i)) {
-                    (Some(n), Some((_, avg))) => {
-                        if *above {
-                            n > *avg
-                        } else {
-                            n < *avg
-                        }
-                    }
-                    _ => false,
-                },
-                FilterCriterion::FillColor(col) => wb.styles.get(sh.style_id(c)).fill.fg == *col,
-                FilterCriterion::FontColor(col) => wb.styles.get(sh.style_id(c)).font.color == *col,
+                Prepared::Top10 { bottom, threshold } => v.as_f64().is_some_and(|n| {
+                    let threshold = threshold.unwrap_or(n);
+                    if *bottom { n <= threshold } else { n >= threshold }
+                }),
+                Prepared::AboveAverage { above, average } => v.as_f64().is_some_and(|n| if *above { n > *average } else { n < *average }),
+                Prepared::FillColor(color) => wb.styles.get(sh.style_id(c)).fill.fg == **color,
+                Prepared::FontColor(color) => wb.styles.get(sh.style_id(c)).font.color == **color,
                 // Icons are not evaluated here: the row keeps its current visibility.
-                FilterCriterion::Icon { .. } => !sh.is_row_hidden(row),
-            };
-            if !ok {
-                visible = false;
-                break;
+                Prepared::Icon => !sh.is_row_hidden(row),
             }
-        }
+        });
         hide.push((row, !visible));
     }
-    if let Some(t) = evaluate {
-        eprintln!("filter: predicates {:?}, {} rows", t.elapsed(), hide.len());
+    if let Some(t) = profile.lap() {
+        eprintln!("filter: predicates {t:?}, {} rows", hide.len());
     }
-    #[allow(clippy::disallowed_methods)]
-    let update = profile.map(|_| std::time::Instant::now());
     let Some(shm) = wb.sheet_mut(sheet) else { return };
     for (row, h) in hide {
         if h {
@@ -830,8 +813,8 @@ pub(crate) fn apply_filter(wb: &mut Workbook, sheet: usize) {
             e.hidden = false;
         }
     }
-    if let Some(t) = update {
-        eprintln!("filter: visibility {:?}", t.elapsed());
+    if let Some(t) = profile.lap() {
+        eprintln!("filter: visibility {t:?}");
     }
 }
 
