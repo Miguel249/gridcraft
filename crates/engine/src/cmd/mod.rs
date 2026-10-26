@@ -406,7 +406,7 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
         eprintln!("commit: edit {t:?}, {} changed", changed.len());
     }
     if structural {
-        if visibility_only && changed.is_empty() {
+        if visibility_only && changed.is_empty() && graph_inputs_unchanged(&d.wb, &wb) {
             d.calc.recalc_after_visibility_change(&mut wb);
         } else {
             d.calc.recalc_all(&mut wb);
@@ -428,6 +428,25 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
     d.wb = std::sync::Arc::new(wb);
     d.selection = sel;
     Ok(r)
+}
+
+/// Whether the dependency graph built for `old` still serves `new`: the same sheets in the same
+/// order, calculation settings, defined names, tables and formulas. A `visibility_only` commit
+/// that fails this check (a command that set the flag too eagerly) recalculates in full instead.
+/// Unchanged sheets are shared, and a changed one compares only the cell bands that differ.
+fn graph_inputs_unchanged(old: &Workbook, new: &Workbook) -> bool {
+    old.calc == new.calc
+        && old.names == new.names
+        && old.sheets.len() == new.sheets.len()
+        && old.sheets.iter().zip(&new.sheets).all(|(a, b)| {
+            std::sync::Arc::ptr_eq(a, b)
+                || (a.name == b.name
+                    && a.tables == b.tables
+                    && a.cells
+                        .diff(&b.cells)
+                        .into_iter()
+                        .all(|c| a.cell(c).and_then(|x| x.formula.as_ref()) == b.cell(c).and_then(|x| x.formula.as_ref())))
+        })
 }
 
 /// Excel's message for an edit of a locked cell on a protected sheet.

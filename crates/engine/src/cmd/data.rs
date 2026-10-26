@@ -538,6 +538,7 @@ fn toggle_filter(s: &mut Session, p: &Json) -> Result<Json> {
                 }
             }
             cx.structural = true;
+            cx.visibility_only = true;
             Ok(json!({"filter": false}))
         });
     }
@@ -1459,6 +1460,7 @@ fn detail(s: &mut Session, p: &Json, hide: bool) -> Result<Json> {
             }
         }
         cx.structural = true;
+        cx.visibility_only = true;
         Ok(Json::Null)
     })
 }
@@ -1501,6 +1503,7 @@ fn show_levels(s: &mut Session, p: &Json) -> Result<Json> {
             }
         }
         cx.structural = true;
+        cx.visibility_only = true;
         Ok(Json::Null)
     })
 }
@@ -1711,6 +1714,79 @@ mod tests {
         let sh = s.doc().unwrap().wb.active().unwrap();
         assert_eq!(sh.tables[0].columns[1].name, "Price");
         assert_eq!(sh.cell(CellRef::new(0, 3)).and_then(|c| c.formula.as_ref()).map(|f| f.text.as_str()), Some("SUM(Table1[Price])"));
+    }
+
+    #[test]
+    fn hiding_rows_outline_levels_and_removing_the_filter_reuse_the_graph() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range":"A1","values":[["Qty"],[1],[2],[3],[4]]})).unwrap();
+        for (cell, formula) in [("C1", "=SUBTOTAL(109,A2:A5)"), ("C2", "=AGGREGATE(9,5,A2:A5)"), ("C3", "=C1+C2")] {
+            s.execute("cell.set", json!({"cell":cell,"input":formula})).unwrap();
+        }
+        s.execute("data.group", json!({"rows":"2:5"})).unwrap();
+        s.execute("data.filter", json!({"range":"A1:A5"})).unwrap();
+        for (command, params) in [
+            ("home.hideRows", json!({"rows":"3:3"})),
+            ("home.unhideRows", json!({"rows":"3:3"})),
+            ("data.filterBy", json!({"column":"A","custom":{"op":">","value":2}})),
+            // A second data.filter turns the AutoFilter off and shows the rows it hid.
+            ("data.filter", json!({"range":"A1:A5"})),
+            ("data.hideDetail", json!({"rows":"2:5"})),
+            ("data.showDetail", json!({"rows":"2:5"})),
+            ("data.showLevels", json!({"rows":1})),
+        ] {
+            assert!(!rebuilt_and_matches_full_recalc(&mut s, command, params), "{command}");
+        }
+        let sh = s.doc().unwrap().wb.active().unwrap();
+        assert!(sh.autofilter.is_none());
+        assert!(sh.is_row_hidden(1), "level 1 hides the detail");
+        assert_eq!(sh.value(CellRef::new(0, 2)), Value::Number(0.0));
+    }
+
+    #[test]
+    fn visibility_only_commits_that_change_graph_inputs_rebuild_it() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range":"A1","values":[[1],[2]]})).unwrap();
+        s.execute("cell.set", json!({"cell":"B1","input":"=A1*2"})).unwrap();
+        s.execute("range.setValues", json!({"range":"E1","values":[["H"],["x"]]})).unwrap();
+        s.execute("insert.table", json!({"range":"E1:E2","header":true})).unwrap();
+        // Commands that wrongly flag edits as visibility-only: a new formula the graph does not
+        // know, a defined name, a renamed table.
+        let edits: [fn(&mut Ctx) -> Result<()>; 3] = [
+            |cx| {
+                cx.sheet_mut(0)?.set_cell(CellRef::new(0, 2), Cell::formula(gridcraft_model::Formula::new("=A1+10")));
+                Ok(())
+            },
+            |cx| {
+                let name = DefinedName { name: "Two".into(), scope: None, formula: "Sheet1!$A$2".into(), comment: String::new(), hidden: false };
+                cx.wb.names.push(name);
+                Ok(())
+            },
+            |cx| {
+                if let Some(t) = cx.sheet_mut(0)?.tables.first_mut() {
+                    t.name = "Renamed".into();
+                }
+                Ok(())
+            },
+        ];
+        for (i, edit) in edits.into_iter().enumerate() {
+            let d = s.doc_mut().unwrap();
+            let before = d.calc.graph_rebuilds;
+            commit(d, |cx| {
+                edit(cx)?;
+                cx.structural = true;
+                cx.visibility_only = true;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(d.calc.graph_rebuilds, before + 1, "edit {i}");
+            let mut reference = (*d.wb).clone();
+            d.calc.clone().recalc_all(&mut reference);
+            assert_eq!(*d.wb, reference, "edit {i}");
+        }
+        assert_eq!(s.doc().unwrap().wb.active().unwrap().value(CellRef::new(0, 2)), Value::Number(11.0));
     }
 
     #[test]
