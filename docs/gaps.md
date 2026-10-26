@@ -31,6 +31,9 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 - **Evidence:** #175; no threading in `crates/calc`; PR #152 (whole-sheet Fill/Remove Duplicates
   out of memory), PR #151 (current region past 10,000 rows).
 - **Impact:** finance and data users routinely have big workbooks.
+- **Done:** large-sheet navigation and filtering no longer scan the whole sheet per frame or
+  rebuild the dependency graph per filter ([large-workbook-performance.md](large-workbook-performance.md));
+  every formula is still evaluated on a filter, and whole-workbook XLSX import remains a cost.
 - **Estimate:** 25–40 h. [target-app-parity.md](target-app-parity.md#performance), [hardware-parity.md](hardware-parity.md)
 
 ### 3. Some unmodelled XLSX content is dropped on save (FF)
@@ -181,14 +184,9 @@ No alpha blockers: every core workflow passes the [alpha gate](roadmap.md#alpha-
 
 ## Revision history
 
-Large-workbook navigation and filter optimizations, including tests up to one million rows,
-are documented in [large-workbook-performance.md](large-workbook-performance.md). They do
-not establish GPU FPS or multi-core recalculation parity; full formula evaluation and
-whole-workbook XLSX import remain relevant costs.
-
 | Date | Change | Summary |
 |---|---|---|
-| 2026-10-26 | minor | Added measured large-workbook performance work and remaining GPU/import/recalc limitations; readiness estimates are unchanged. |
+| 2026-10-26 | minor | §2: large-sheet navigation and filtering work landed (measurements in large-workbook-performance.md); GPU FPS, multi-threaded recalc and streaming import remain; estimate unchanged |
 | 2026-10-24 | minor | §8: PivotTable Enable show details: `pivot.options` `enableShowDetails` turns Show Details off for a PivotTable, read and written in XLSX as `enableDrill` |
 | 2026-10-23 | minor | §8: PivotTable Show Details: double-clicking a value cell lists its source records on a new sheet (#2364) |
 | 2026-10-22 | minor | §20: a native window per workbook window, New Window on the same workbook and Arrange All on the desktop; left: Arrange All across monitors, the web's one window, pen pressure (estimate 10–14 h → 5–8 h) |

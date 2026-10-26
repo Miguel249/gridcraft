@@ -46,10 +46,13 @@ including tests, 2026-10-10.
    `#SPILL!`/cycles. Volatile functions are always dirty.
 4. **Rendering**: the egui grid reads display values (number formats applied in `engine/display.rs`)
    for the visible window only; charts render through `crates/chart` primitives.
-   Used cell bounds are cached per store; geometry indexes are reused for one immutable sheet
-   snapshot through weak identity. Conditional-format statistics are borrowed per cell and
-   skipped for rules that need no range aggregates. Filter-only edits reuse the dependency
-   graph while still evaluating every formula; table workbooks keep the full rebuild.
+   Used cell bounds are cached per store (a new cell extends them; only removing a cell on
+   their edge drops them). Row/column geometry indexes are reused while a sheet's lines,
+   default sizes and outline summary side stay the same. Conditional-format statistics are
+   borrowed per cell and skipped for rules that need no range aggregates. Visibility-only
+   edits (filters, hidden rows and columns, outline detail and levels, AutoFilter off) reuse
+   the dependency graph while still evaluating every formula, once `commit` has checked that
+   formulas, names, tables and sheets are unchanged; a table header rewrite rebuilds it.
    See [large-workbook-performance.md](large-workbook-performance.md) for measurements and
    cache invalidation contracts.
 5. **Files**: `engine/io.rs` sniffs content (XLSX, XLSB, ODS) before trusting the extension and
