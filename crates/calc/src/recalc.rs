@@ -377,11 +377,14 @@ pub struct Calc {
     /// Cells whose formulas have errors from cycles.
     pub circular: Vec<Key>,
     pub last_recalc_cells: usize,
+    /// How often `rebuild` ran. A commit that only changes row visibility keeps the graph, which
+    /// tests observe as an unchanged count.
+    pub graph_rebuilds: usize,
 }
 
 impl Default for Calc {
     fn default() -> Self {
-        Calc { graph: Graph::default(), rng: 0x9E37_79B9_7F4A_7C15, fixed_now: None, circular: vec![], last_recalc_cells: 0 }
+        Calc { graph: Graph::default(), rng: 0x9E37_79B9_7F4A_7C15, fixed_now: None, circular: vec![], last_recalc_cells: 0, graph_rebuilds: 0 }
     }
 }
 
@@ -1005,6 +1008,7 @@ impl Calc {
 
     /// Rebuilds the graph from scratch.
     pub fn rebuild(&mut self, wb: &Workbook) {
+        self.graph_rebuilds = self.graph_rebuilds.saturating_add(1);
         self.graph = Graph::default();
         let mut circ = Vec::new();
         for (si, sheet) in wb.sheets.iter().enumerate() {

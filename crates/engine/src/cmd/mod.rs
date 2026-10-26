@@ -333,7 +333,7 @@ pub struct Ctx<'a> {
     pub changed: Vec<Key>,
     pub structural: bool,
     /// Only filter/row visibility changed, so the existing dependency graph is valid.
-    /// Table header synchronization clears this conservative optimization flag.
+    /// Table header synchronization clears it when it rewrites a header cell or renames a column.
     pub visibility_only: bool,
     pub sel: &'a mut Selection,
     /// Rows whose automatic height should be recomputed (sheet, row).

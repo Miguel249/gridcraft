@@ -1651,6 +1651,19 @@ fn subtotal(s: &mut Session, p: &Json) -> Result<Json> {
 mod tests {
     use super::*;
 
+    /// Runs `command`, checks the workbook equals a full recalculation of itself and returns
+    /// whether the commit rebuilt the dependency graph.
+    fn rebuilt_and_matches_full_recalc(s: &mut Session, command: &str, params: Json) -> bool {
+        let before = s.doc().unwrap().calc.graph_rebuilds;
+        s.execute(command, params).unwrap();
+        let d = s.doc().unwrap();
+        let mut reference = (*d.wb).clone();
+        let mut calc = d.calc.clone();
+        calc.recalc_all(&mut reference);
+        assert_eq!(*d.wb, reference, "{command}");
+        d.calc.graph_rebuilds != before
+    }
+
     #[test]
     fn filters_reusing_graph_match_full_recalc_after_edits_and_undo() {
         let mut s = Session::new();
@@ -1660,21 +1673,61 @@ mod tests {
             s.execute("cell.set", json!({"cell":cell,"input":formula})).unwrap();
         }
         s.execute("data.filter", json!({"range":"A1:A5"})).unwrap();
-        for (command, params) in [
-            ("data.filterBy", json!({"column":"A","custom":{"op":">","value":2}})),
-            ("cell.set", json!({"cell":"A2","input":"5"})),
-            ("data.reapply", json!({})),
-            ("data.clearFilter", json!({})),
-            ("edit.undo", json!({})),
-            ("edit.redo", json!({})),
+        // (command, params, whether it rebuilds the graph): filters keep it, undo and redo rebuild it.
+        for (command, params, rebuilds) in [
+            ("data.filterBy", json!({"column":"A","custom":{"op":">","value":2}}), false),
+            ("cell.set", json!({"cell":"A2","input":"5"}), false),
+            ("data.reapply", json!({}), false),
+            ("data.clearFilter", json!({}), false),
+            ("edit.undo", json!({}), true),
+            ("edit.redo", json!({}), true),
+            // The graph rebuilt by undo/redo serves the next filters.
+            ("data.filterBy", json!({"column":"A","custom":{"op":"<","value":4}}), false),
+            ("edit.undo", json!({}), true),
+            ("data.reapply", json!({}), false),
         ] {
-            s.execute(command, params).unwrap();
-            let d = s.doc().unwrap();
-            let mut reference = (*d.wb).clone();
-            let mut calc = d.calc.clone();
-            calc.recalc_all(&mut reference);
-            assert_eq!(*d.wb, reference, "{command}");
+            assert_eq!(rebuilt_and_matches_full_recalc(&mut s, command, params), rebuilds, "{command}");
         }
+    }
+
+    #[test]
+    fn filters_in_a_table_reuse_the_graph_while_its_headers_stay() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range":"A1","values":[["Qty","Price"],[1,10],[2,20],[3,30],[4,40]]})).unwrap();
+        s.execute("insert.table", json!({"range":"A1:B5","header":true})).unwrap();
+        for (cell, formula) in [("D1", "=SUBTOTAL(109,Table1[Qty])"), ("D2", "=SUM(Table1[Price])"), ("D3", "=D1+D2")] {
+            s.execute("cell.set", json!({"cell":cell,"input":formula})).unwrap();
+        }
+        s.execute("selection.set", json!({"cell":"A1"})).unwrap();
+        assert!(!rebuilt_and_matches_full_recalc(&mut s, "data.filterBy", json!({"column":"A","custom":{"op":">","value":2}})));
+        assert_eq!(s.doc().unwrap().wb.active().unwrap().value(CellRef::new(0, 3)), Value::Number(7.0));
+        for command in ["data.reapply", "data.clearFilter"] {
+            assert!(!rebuilt_and_matches_full_recalc(&mut s, command, json!({})), "{command}");
+        }
+        assert_eq!(s.doc().unwrap().wb.active().unwrap().value(CellRef::new(0, 3)), Value::Number(10.0));
+    }
+
+    #[test]
+    fn filters_that_rename_a_table_column_rebuild_the_graph() {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range":"A1","values":[["Qty","Price"],[1,10],[2,20],[3,30],[4,40]]})).unwrap();
+        s.execute("insert.table", json!({"range":"A1:B5","header":true})).unwrap();
+        // As a file can hold it: the header cell says Price while the table calls the column Cost.
+        let d = s.doc_mut().unwrap();
+        let mut wb = (*d.wb).clone();
+        let sh = wb.sheet_mut(0).unwrap();
+        sh.tables[0].columns[1].name = "Cost".into();
+        sh.set_cell(CellRef::new(0, 3), Cell::formula(gridcraft_model::Formula::new("=SUM(Table1[Cost])")));
+        d.calc.recalc_all(&mut wb);
+        d.wb = std::sync::Arc::new(wb);
+        s.execute("selection.set", json!({"cell":"A1"})).unwrap();
+        // The filter's header check renames the column and rewrites the formula: the graph is rebuilt.
+        assert!(rebuilt_and_matches_full_recalc(&mut s, "data.filterBy", json!({"column":"A","custom":{"op":">","value":2}})));
+        let sh = s.doc().unwrap().wb.active().unwrap();
+        assert_eq!(sh.tables[0].columns[1].name, "Price");
+        assert_eq!(sh.cell(CellRef::new(0, 3)).and_then(|c| c.formula.as_ref()).map(|f| f.text.as_str()), Some("SUM(Table1[Price])"));
     }
 
     #[test]
