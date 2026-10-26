@@ -45,12 +45,23 @@ enum StatsNeed {
 }
 
 fn stats_need(rule: &CfRule) -> Option<StatsNeed> {
+    // Exhaustive on purpose: a new rule kind must decide whether it reads range statistics.
     match rule {
         CfRule::Duplicate { .. } | CfRule::Unique { .. } => Some(StatsNeed::Counts),
         CfRule::Top10 { .. } | CfRule::AboveAverage { .. } | CfRule::ColorScale { .. } | CfRule::DataBar { .. } | CfRule::IconSet { .. } => {
             Some(StatsNeed::Numbers)
         }
-        _ => None,
+        CfRule::CellIs { .. }
+        | CfRule::Expression { .. }
+        | CfRule::ContainsText { .. }
+        | CfRule::NotContainsText { .. }
+        | CfRule::BeginsWith { .. }
+        | CfRule::EndsWith { .. }
+        | CfRule::Blanks { .. }
+        | CfRule::NoBlanks { .. }
+        | CfRule::Errors { .. }
+        | CfRule::NoErrors { .. }
+        | CfRule::TimePeriod { .. } => None,
     }
 }
 
