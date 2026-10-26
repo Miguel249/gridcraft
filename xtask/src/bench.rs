@@ -69,8 +69,18 @@ fn rows(dataset: &str) -> u32 {
     }
 }
 
+/// The benchmark runs in the workspace root, so the user's `--exe` and `--input` are resolved
+/// against this process's directory first: the files checked and hashed are the ones it uses.
+fn resolve_paths(o: &mut Options) -> Result<(), String> {
+    for path in [&mut o.exe, &mut o.input].into_iter().flatten() {
+        *path = std::path::absolute(&*path).map_err(|e| format!("bench: {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
 pub fn run(root: &Path, args: &[&str]) -> Result<(), String> {
-    let o = parse(args)?;
+    let mut o = parse(args)?;
+    resolve_paths(&mut o)?;
     let example = if o.input.is_some() { "workbook_file_perf" } else { "large_workbooks" };
     let exe = match &o.exe {
         Some(exe) => exe.clone(),
@@ -280,6 +290,16 @@ mod tests {
         assert_eq!(o.datasets, vec!["USER".to_string()]);
         for bad in [&["--label", "../x"][..], &["--label", "a/b"], &["--repeats", "0"], &["--datasets", "Z"], &["--repeats"], &["--frobnicate"]] {
             assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn user_paths_resolve_against_the_callers_directory() {
+        let mut o = parse(&["--input", "book.xlsx", "--exe", "build/large_workbooks.exe"]).unwrap();
+        resolve_paths(&mut o).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        for (path, end) in [(o.input.unwrap(), "book.xlsx"), (o.exe.unwrap(), "large_workbooks.exe")] {
+            assert!(path.is_absolute() && path.starts_with(&cwd) && path.ends_with(end), "{}", path.display());
         }
     }
 
