@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (wb, warnings) = gridcraft_engine::io::open_bytes(path, &bytes)?;
         read.push(t.elapsed().as_secs_f64() * 1000.0);
         let c = Instant::now();
-        session.add_document(DocState::new(wb, Some(path.clone()), "Benchmark".into()));
+        session.add_document(DocState::new(wb, Some(path.clone()), "Benchmark".into(), gridcraft_engine::Trust::FromFile));
         calc.push(c.elapsed().as_secs_f64() * 1000.0);
         open.push(t.elapsed().as_secs_f64() * 1000.0);
         println!("bytes={} warnings={} formulas={}", bytes.len(), warnings.len(), session.doc()?.calc.last_recalc_cells);
@@ -56,11 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Largest populated sheet, rather than assuming the saved active sheet is the data.
     let si = session.doc()?.wb.sheets.iter().enumerate().max_by_key(|(_, sh)| sh.cells.len()).map(|(i, _)| i).ok_or("no sheets")?;
-    session.doc_mut()?.wb = {
-        let mut wb = (*session.doc()?.wb).clone();
-        wb.active_sheet = si;
-        std::sync::Arc::new(wb)
-    };
+    session.doc()?.wb.set_active_sheet(si);
     let sh = session.doc()?.wb.sheet(si).ok_or("missing sheet")?;
     let used = sh.used_range().ok_or("empty workbook")?;
     let range = sh.autofilter.as_ref().map(|f| f.range).unwrap_or(used);

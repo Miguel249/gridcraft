@@ -122,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let t = Instant::now();
     let mut session = Session::new();
-    session.add_document(DocState::new(wb, None, "Benchmark".into()));
+    session.add_document(DocState::new(wb, None, "Benchmark".into(), gridcraft_engine::Trust::Local));
     println!("initial_graph_and_calc_ms={:.3} formulas={}", t.elapsed().as_secs_f64() * 1000.0, session.doc()?.calc.last_recalc_cells);
     session.execute("data.filter", json!({"range":format!("A1:L{}",rows+1)}))?;
     for threshold in [10, 90] {
