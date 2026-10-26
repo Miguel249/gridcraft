@@ -427,6 +427,54 @@ mod tests {
     }
 
     #[test]
+    fn statistics_of_a_filtered_range_still_count_its_hidden_cells() {
+        // As in Excel: with A2:A11 = 1..10 filtered to A>5, "above average" still compares with
+        // 5.5 (not 8) and "bottom 2" still marks the hidden 1 and 2.
+        let mut s = crate::Session::new();
+        s.new_workbook();
+        let values: Vec<_> = std::iter::once(json!(["N"])).chain((1..=10).map(|n| json!([n]))).collect();
+        s.execute("range.setValues", json!({"range": "A1", "values": values})).unwrap();
+        let (mut bold, mut italic) = (Style::default(), Style::default());
+        bold.font.bold = true;
+        italic.font.italic = true;
+        let d = s.doc_mut().unwrap();
+        let mut wb = (*d.wb).clone();
+        let sh = wb.sheet_mut(0).unwrap();
+        let range = RangeRef::parse("A2:A11").unwrap();
+        sh.cond_formats.push(CondFormat {
+            ranges: vec![range],
+            rule: CfRule::AboveAverage { below: false, equal: false, std_dev: 0, style: Box::new(bold) },
+            priority: 1,
+            stop_if_true: false,
+        });
+        sh.cond_formats.push(CondFormat {
+            ranges: vec![range],
+            rule: CfRule::Top10 { bottom: true, percent: false, rank: 2, style: Box::new(italic) },
+            priority: 2,
+            stop_if_true: false,
+        });
+        d.wb = std::sync::Arc::new(wb);
+        let looks = |s: &crate::Session| -> Vec<(bool, bool)> {
+            let mut cache = CfCache::new();
+            let wb = &s.doc().unwrap().wb;
+            (1..=10)
+                .map(|row| {
+                    let style = cache.look(wb, 0, CellRef::new(row, 0)).and_then(|l| l.style).unwrap_or_default();
+                    (style.font.bold, style.font.italic)
+                })
+                .collect()
+        };
+        let unfiltered = looks(&s);
+        let expected: Vec<(bool, bool)> = (1..=10).map(|n| (n > 5, n <= 2)).collect();
+        assert_eq!(unfiltered, expected);
+        s.execute("data.filter", json!({"range": "A1:A11"})).unwrap();
+        s.execute("data.filterBy", json!({"column": "A", "custom": {"op": ">", "value": 5}})).unwrap();
+        let sh = s.doc().unwrap().wb.active().unwrap();
+        assert!((1..=5).all(|row| sh.is_row_hidden(row)) && (6..=10).all(|row| !sh.is_row_hidden(row)));
+        assert_eq!(looks(&s), unfiltered, "hidden cells still count in the statistics");
+    }
+
+    #[test]
     fn statistical_rules_share_stats_and_preserve_duplicate_matching() {
         let mut wb = Workbook::new();
         let sh = wb.sheet_mut(0).unwrap();
