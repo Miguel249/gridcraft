@@ -290,24 +290,62 @@ impl Axes {
     }
 }
 
-/// Bounded to one sheet. A weak identity does not retain its cells or undo snapshot.
-/// `Arc::make_mut` detaches weak pointers even with a single strong owner, so any model
-/// mutation (including direct row/column edits) invalidates the indexes automatically.
+/// What `Axes` are built from. A sheet edit that keeps all of it (a cell, the zoom, the view)
+/// reuses the indexes.
+#[derive(PartialEq)]
+struct AxesKey {
+    rows: std::collections::BTreeMap<u32, gridcraft_engine::model::LineInfo>,
+    cols: std::collections::BTreeMap<u32, gridcraft_engine::model::LineInfo>,
+    default_row_height: f32,
+    default_col_width: f32,
+    summary_below: bool,
+    summary_right: bool,
+}
+
+impl AxesKey {
+    fn of(sh: &Sheet) -> Self {
+        Self {
+            rows: sh.rows.clone(),
+            cols: sh.cols.clone(),
+            default_row_height: sh.default_row_height,
+            default_col_width: sh.default_col_width,
+            summary_below: sh.summary_below,
+            summary_right: sh.summary_right,
+        }
+    }
+
+    fn matches(&self, sh: &Sheet) -> bool {
+        self.default_row_height == sh.default_row_height
+            && self.default_col_width == sh.default_col_width
+            && self.summary_below == sh.summary_below
+            && self.summary_right == sh.summary_right
+            && self.rows == sh.rows
+            && self.cols == sh.cols
+    }
+}
+
+/// Bounded to one sheet. The weak identity of the last sheet snapshot (which retains neither its
+/// cells nor an undo snapshot) skips the key comparison while the sheet is unchanged; `make_mut`
+/// detaches weak pointers even with a single strong owner, so any edit compares the key, and only
+/// a change to the lines, their default sizes or the outline's summary side rebuilds the axes.
 #[derive(Default)]
 pub struct GeometryCache {
     source: std::sync::Weak<Sheet>,
-    axes: Option<Axes>,
+    axes: Option<(AxesKey, Axes)>,
 }
 
 impl GeometryCache {
     pub fn geometry(&mut self, sh: &Arc<Sheet>, rect: Rect, scroll: egui::Vec2) -> Geo {
         let source = Arc::downgrade(sh);
-        if !self.source.ptr_eq(&source) || self.axes.is_none() {
-            self.axes = Some(Axes::new(sh));
-            self.source = source;
-        }
-        // The fallback also keeps this constructor total if the cache is ever empty.
-        let axes = self.axes.clone().unwrap_or_else(|| Axes::new(sh));
+        let axes = match &self.axes {
+            Some((key, axes)) if self.source.ptr_eq(&source) || key.matches(sh) => axes.clone(),
+            _ => {
+                let axes = Axes::new(sh);
+                self.axes = Some((AxesKey::of(sh), axes.clone()));
+                axes
+            }
+        };
+        self.source = source;
         Geo::with_axes(sh, rect, scroll, axes)
     }
 }
@@ -371,10 +409,6 @@ impl Geo {
     }
     /// Page Layout view geometry: `rect` excludes the rulers; cells are drawn at the print scale
     /// on pages laid out by `grid`; frozen panes don't apply (as in Excel).
-    pub fn paged(sh: &Sheet, rect: Rect, scroll: egui::Vec2, grid: Arc<gridcraft_engine::paper::PageGrid>) -> Geo {
-        Geo::new(sh, rect, scroll).on_page(sh, grid)
-    }
-
     fn on_page(mut self, sh: &Sheet, grid: Arc<gridcraft_engine::paper::PageGrid>) -> Geo {
         let zoom = (sh.zoom as f32 / 100.0).clamp(0.1, 4.0);
         self.z = zoom * DISPLAY_SCALE * grid.scale.clamp(0.1, 4.0);
@@ -4269,17 +4303,46 @@ mod tests {
         assert_eq!(hidden.ri.start(101), Geo::new(&sh, rect, b.scroll).ri.start(101));
         let undo = cache.geometry(&snapshot, rect, b.scroll);
         assert_eq!(undo.ri.start(101), b.ri.start(101));
-        // Weak identity must also invalidate with only one strong owner.
+        // With a single strong owner, `make_mut` must still detach the cache's weak pointer, so
+        // the cache points at `sh` itself before the edit.
         drop(snapshot);
+        let current = cache.geometry(&sh, rect, b.scroll);
+        let before = Arc::as_ptr(&sh);
         Arc::make_mut(&mut sh).default_row_height = 30.0;
+        assert_ne!(Arc::as_ptr(&sh), before, "the weak pointer moves the edited sheet");
         Arc::make_mut(&mut sh).cols.insert(2, LineInfo { hidden: true, ..Default::default() });
         let changed = cache.geometry(&sh, rect, b.scroll);
         let fresh = Geo::new(&sh, rect, b.scroll);
         assert_eq!(changed.ri.start(101), fresh.ri.start(101));
         assert_eq!(changed.ci.start(3), fresh.ci.start(3));
-        assert!(!Arc::ptr_eq(&hidden.ri, &changed.ri));
+        assert!(!Arc::ptr_eq(&current.ri, &changed.ri));
         drop(sh);
         assert!(cache.source.upgrade().is_none(), "cache must not retain the sheet");
+    }
+
+    #[test]
+    fn geometry_cache_keeps_indexes_across_zoom_and_cell_edits() {
+        use super::*;
+        use gridcraft_engine::model::{Cell, LineInfo};
+        let mut sh = Arc::new(Sheet::new("Test"));
+        Arc::make_mut(&mut sh).rows.insert(100, LineInfo { size: Some(40.0), outline: 1, ..Default::default() });
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0));
+        let mut cache = GeometryCache::default();
+        let first = cache.geometry(&sh, rect, vec2(0.0, 0.0));
+        // Neither the zoom nor a cell feeds the indexes: the same ones serve the new zoom.
+        Arc::make_mut(&mut sh).zoom = 200;
+        Arc::make_mut(&mut sh).set_cell(CellRef::new(5, 5), Cell::value(1.0.into()));
+        let zoomed = cache.geometry(&sh, rect, vec2(0.0, 0.0));
+        assert!(Arc::ptr_eq(&first.ri, &zoomed.ri));
+        assert!(Arc::ptr_eq(&first.ci, &zoomed.ci));
+        assert!(Arc::ptr_eq(&first.row_outline, &zoomed.row_outline));
+        assert!((zoomed.z / first.z - 2.0).abs() < 1e-6, "the geometry follows the zoom");
+        // The summary side does feed the outline: it rebuilds the axes.
+        let below = sh.summary_below;
+        Arc::make_mut(&mut sh).summary_below = !below;
+        let moved = cache.geometry(&sh, rect, vec2(0.0, 0.0));
+        assert!(!Arc::ptr_eq(&zoomed.row_outline, &moved.row_outline));
+        assert_eq!(moved.row_outline.groups, Geo::new(&sh, rect, vec2(0.0, 0.0)).row_outline.groups);
     }
 
     #[test]
