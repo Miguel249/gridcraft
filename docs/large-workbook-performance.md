@@ -9,17 +9,20 @@ workbooks in memory. Production has no per-cell timing or allocator interception
 `GRIDCRAFT_PROFILE=1` extends the existing commit/calc logging with filter preparation,
 predicate evaluation and visibility-update timings. Keep it off for comparisons.
 
-Build with `cargo build --release -p gridcraft-ui-egui --example large_workbooks` and run:
+Run it on any platform with:
 
-```powershell
-./scripts/bench-large-workbooks.ps1 -Label current -Repeats 5
+```sh
+cargo xtask bench --label current --repeats 5
 ```
 
-The wrapper runs datasets sequentially, records stdout/stderr, compiler, source commit,
-hardware and process peak working set in `target/perf/<label>/`. Preserve the original
-release executable before rebuilding; use **separate Cargo target directories for separate
-source checkouts**, then compare it with the candidate on the same machine,
-with no concurrent builds or benchmarks. A and H share values; both run 89% and 9%
+`cargo xtask bench` builds the example in release, then runs the datasets one process at a
+time (`--datasets A,B` picks some) and records in `target/perf/<label>/` each dataset's
+stdout (with the example's p50/p95/p99) and stderr, the source commit and working-tree
+status, `rustc -Vv`, the hardware, the SHA-256 of the executable (and of an input
+workbook) and each process's peak memory: the peak working set on Windows, `VmHWM` on Linux
+and the largest `ps` resident-size sample elsewhere (every 100 ms). To compare two source
+checkouts, build each in **its own Cargo target directory** and pass the other build with
+`--exe <path>`; run both on the same machine with no concurrent builds or benchmarks. A and H share values; both run 89% and 9%
 selectivity numeric filters. Repetitions are warmed within one process and include the
 first operation (cold caches); each dataset starts a new process.
 
@@ -39,11 +42,10 @@ Microsoft assets. The user's workbook is read from Downloads and is never writte
 committed. Synthetic measurements do not substitute for its exact styles, functions or
 sheets. The separate `workbook_file_perf` example measures file read/import, initial
 graph/calculation, complete open, numeric filters on the largest sheet, CPU frames and
-saving to memory. Reproduce with:
+saving to memory. Run it on a workbook with:
 
-```powershell
-cargo build --release -p gridcraft-ui-egui --example workbook_file_perf
-./scripts/bench-large-workbooks.ps1 -Executable target/release/examples/workbook_file_perf.exe -Label real-current -InputWorkbook "$env:USERPROFILE/Downloads/Benchmark_GridCraft_vs_Excel_100k.xlsx" -Repeats 5
+```sh
+cargo xtask bench --label real-current --input <workbook.xlsx> --repeats 5
 ```
 
 Input SHA-256: `18be34eeeb595391759bc9dd411af0aef0640fadbd43d4f96d5de6cea7854776`;
@@ -230,7 +232,7 @@ read/import are measured at their respective boundaries, not inferred as finer p
 | `crates/calc/src/recalc.rs`, `crates/calc/src/tests.rs` | Re-evaluation with unchanged dependencies; cross-sheet, spill, cycle and volatile equivalence |
 | `crates/engine/src/cmd/mod.rs`, `crates/engine/src/tables.rs` | Filter-only recalculation dispatch and conservative table/header fallback |
 | `crates/ui-egui/examples/large_workbooks.rs`, `workbook_file_perf.rs` | Reproducible synthetic and read-only real-file benchmarks |
-| `scripts/bench-large-workbooks.ps1` | Sequential runs, hardware/compiler/input/executable hashes and peak working set |
+| `xtask/src/bench.rs` | `cargo xtask bench`: sequential runs, hardware/compiler/input/executable hashes and peak memory on every platform |
 | `ROADMAP.md`, `docs/architecture.md`, `docs/gaps.md`, this report | Performance status, method, evidence and limitations |
 
 Suggested review summary: large-sheet scrolling repeatedly scanned full data and copied
